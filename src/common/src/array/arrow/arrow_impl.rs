@@ -369,7 +369,6 @@ pub trait ToArrow {
             DataType::Serial => self.serial_type_to_arrow(),
             DataType::Decimal => return Ok(self.decimal_type_to_arrow(name)),
             DataType::Jsonb => return Ok(self.jsonb_type_to_arrow(name)),
-            // TODO: support the Parquet Variant Arrow extension layout.
             DataType::Variant => {
                 return Err(ArrayError::to_arrow(
                     "VARIANT is not supported in Arrow conversion yet",
@@ -664,9 +663,9 @@ pub trait FromArrow {
         ) = (field.data_type(), array.data_type())
         {
             let dominated = Self::struct_fields_dominated(expected_fields, actual_fields);
-            // Extension-name mismatches on children (e.g. a variant child declared as its
-            // raw physical struct) also need the projected path, which picks the
-            // conversion field per child based on the declared type.
+            // Also force the projected path when the actual children carry extensions the
+            // declaration did not ask for: `from_struct_array` converts by the array's own
+            // fields and would wrongly honor them.
             if dominated || Self::struct_child_extension_mismatch(expected_fields, actual_fields) {
                 let struct_array: &arrow_array::StructArray =
                     array.as_any().downcast_ref().unwrap();
@@ -1047,44 +1046,33 @@ pub trait FromArrow {
             .collect();
 
         let len = array.len();
-        let mut child_types = Vec::with_capacity(expected_fields.len());
         let mut projected_columns = Vec::with_capacity(expected_fields.len());
         for expected_field in expected_fields {
             if let Some(&idx) = actual_name_to_index.get(expected_field.name().as_str()) {
                 let child = array.columns()[idx].clone();
-                // For an extension-typed child (e.g. variant) declared as a non-struct RW
-                // type, only the actual field carries the metadata that routes the
-                // conversion; a struct declaration keeps reading the raw physical layout
-                // via the expected field. The child type must follow the same choice.
-                let actual_field = &actual_fields[idx];
-                let convert_field = if actual_field.extension_type_name().is_some()
-                    && expected_field.extension_type_name().is_none()
-                    && !matches!(
-                        expected_field.data_type(),
-                        arrow_schema::DataType::Struct(_)
-                    ) {
-                    actual_field
-                } else {
-                    expected_field
-                };
-                // Derive the child type from the converted array: for container children
-                // (e.g. map<_, variant> backed by nested variants) the conversion follows
-                // the array-side fields, which the expected field cannot express.
-                let converted = self.from_array(convert_field, &child)?;
-                child_types.push((expected_field.name().clone(), converted.data_type()));
+                // Decode by the expected field so extensions on the actual field cannot
+                // override the declared type.
+                let converted = self.from_array(expected_field, &child)?;
                 projected_columns.push(Arc::new(converted));
             } else {
                 // Field missing in Arrow struct. Fill SQL NULL with the expected RW type.
                 let rw_ty = self.from_field(expected_field)?;
-                let mut builder = ArrayBuilderImpl::with_type(len, rw_ty.clone());
+                let mut builder = ArrayBuilderImpl::with_type(len, rw_ty);
                 builder.append_n(len, Datum::None);
-                child_types.push((expected_field.name().clone(), rw_ty));
                 projected_columns.push(Arc::new(builder.finish()));
             }
         }
 
+        // Derive child types from the converted arrays: container children (e.g.
+        // map<_, variant> backed by nested variants) follow the array-side fields, which
+        // the expected field cannot express.
         Ok(ArrayImpl::Struct(StructArray::new(
-            StructType::new(child_types),
+            StructType::new(
+                expected_fields
+                    .iter()
+                    .zip_eq_fast(&projected_columns)
+                    .map(|(f, c)| (f.name().clone(), c.data_type())),
+            ),
             projected_columns,
             (0..len).map(|i| array.is_valid(i)).collect(),
         )))
@@ -1781,6 +1769,7 @@ mod tests {
     use arrow_schema::{DataType as ArrowType, Field as ArrowField};
 
     use super::*;
+    use crate::array::arrow::IcebergArrowConvert;
     use crate::types::{DataType as RwType, MapType, StructType};
 
     fn variant_field(name: &str) -> ArrowField {
@@ -1860,6 +1849,68 @@ mod tests {
         assert!(is_parquet_field_match_source_schema(
             &arrow_map,
             &RwType::Map(MapType::from_kv(RwType::Varchar, RwType::Variant))
+        ));
+    }
+
+    /// A plain Utf8 field tagged with the `arrowudf.json` arrow extension.
+    fn json_field(name: &str) -> ArrowField {
+        ArrowField::new(name, ArrowType::Utf8, true).with_metadata(
+            [(
+                "ARROW:extension:name".to_owned(),
+                "arrowudf.json".to_owned(),
+            )]
+            .into(),
+        )
+    }
+
+    #[test]
+    fn test_projected_struct_json_child_decodes_as_declared_varchar() {
+        // A struct child tagged `arrowudf.json` but declared as varchar must decode as
+        // varchar: the expected field drives the conversion, not the file-side extension.
+        let s_array: arrow_array::ArrayRef =
+            Arc::new(arrow_array::StringArray::from(vec![Some("1")]));
+        let arrow_struct =
+            arrow_array::StructArray::new(vec![json_field("s")].into(), vec![s_array], None);
+        let arrow_struct_ref: arrow_array::ArrayRef = Arc::new(arrow_struct);
+
+        let declared = RwType::Struct(StructType::new(vec![("s".to_owned(), RwType::Varchar)]));
+        let declared_field = IcebergArrowConvert.to_arrow_field("st", &declared).unwrap();
+
+        let array_impl = IcebergArrowConvert
+            .array_from_arrow_array(&declared_field, &arrow_struct_ref)
+            .unwrap();
+        let ArrayImpl::Struct(s) = array_impl else {
+            panic!("expected RW struct");
+        };
+        let DataType::Struct(st) = s.data_type() else {
+            panic!("expected RW struct type");
+        };
+        assert_eq!(
+            st.types().cloned().collect::<Vec<_>>(),
+            vec![RwType::Varchar]
+        );
+    }
+
+    #[test]
+    fn test_struct_variant_superset_child_matches() {
+        // A parquet struct that is a strict superset of the declared struct still matches
+        // when the shared child is a variant. The child then decodes to Variant (see
+        // `variant_in_projected_struct_decodes_by_declared_type` in arrow_iceberg.rs).
+        let superset_field = ArrowField::new(
+            "st",
+            ArrowType::Struct(
+                vec![
+                    variant_field("v"),
+                    ArrowField::new("extra", ArrowType::Int32, true),
+                ]
+                .into(),
+            ),
+            true,
+        );
+        let declared = RwType::Struct(StructType::new(vec![("v".to_owned(), RwType::Variant)]));
+        assert!(is_parquet_field_match_source_schema(
+            &superset_field,
+            &declared
         ));
     }
 
