@@ -837,14 +837,15 @@ pub enum SqlColumnStrategy {
 /// handled by a row-encode parser or native generator, none of which can produce variant values
 /// (a JSON-encoded variant column would otherwise be silently NULL-padded at ingest).
 ///
-/// Not gated: connector-native schemas (`ENCODE NONE`, e.g. iceberg) infer their own schema.
+/// Not gated: connector-native schemas (`ENCODE NONE`, e.g. iceberg) infer their own schema, and
+/// `ENCODE PARQUET` reads variant columns via the Parquet Variant extension type.
 fn reject_variant_columns_for_unsupported_encoding(
     format_encode: &FormatEncodeOptions,
     columns_from_sql: &[ColumnCatalog],
 ) -> Result<()> {
     if matches!(
         (&format_encode.format, &format_encode.row_encode),
-        (Format::None, Encode::None)
+        (Format::None, Encode::None) | (_, Encode::Parquet)
     ) {
         return Ok(());
     }

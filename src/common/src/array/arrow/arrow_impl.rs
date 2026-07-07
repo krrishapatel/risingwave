@@ -231,7 +231,7 @@ pub trait ToArrow {
         Ok(Arc::new(arrow_array::StringArray::from(array)))
     }
 
-    // TODO(#25165): support the Parquet Variant Arrow extension layout.
+    // TODO: support the Parquet Variant Arrow extension layout.
     #[inline]
     fn variant_to_arrow(&self, _array: &VariantArray) -> Result<arrow_array::ArrayRef, ArrayError> {
         Err(ArrayError::to_arrow(
@@ -369,7 +369,7 @@ pub trait ToArrow {
             DataType::Serial => self.serial_type_to_arrow(),
             DataType::Decimal => return Ok(self.decimal_type_to_arrow(name)),
             DataType::Jsonb => return Ok(self.jsonb_type_to_arrow(name)),
-            // TODO(#25165): support the Parquet Variant Arrow extension layout.
+            // TODO: support the Parquet Variant Arrow extension layout.
             DataType::Variant => {
                 return Err(ArrayError::to_arrow(
                     "VARIANT is not supported in Arrow conversion yet",
@@ -1068,7 +1068,7 @@ pub trait FromArrow {
                     expected_field
                 };
                 // Derive the child type from the converted array: for container children
-                // (e.g. map<_, jsonb> backed by nested variants) the conversion follows
+                // (e.g. map<_, variant> backed by nested variants) the conversion follows
                 // the array-side fields, which the expected field cannot express.
                 let converted = self.from_array(convert_field, &child)?;
                 child_types.push((expected_field.name().clone(), converted.data_type()));
@@ -1667,7 +1667,7 @@ impl From<&arrow_array::Decimal256Array> for Int256Array {
 }
 
 /// Field-aware version of [`is_parquet_schema_match_source_schema`]: additionally matches an
-/// `arrow.parquet.variant` struct against `Jsonb`, which requires the extension name in the
+/// `arrow.parquet.variant` struct against `Variant`, which requires the extension name in the
 /// field metadata. Any other declared type (e.g. the raw physical struct) falls through to
 /// the physical-type match. Prefer this whenever a `Field` is available.
 pub fn is_parquet_field_match_source_schema(
@@ -1678,7 +1678,7 @@ pub fn is_parquet_field_match_source_schema(
 
     if arrow_field.extension_type_name() == Some(parquet_variant_compute::VariantType::NAME)
         && matches!(arrow_field.data_type(), arrow_schema::DataType::Struct(_))
-        && matches!(rw_data_type, crate::types::DataType::Jsonb)
+        && matches!(rw_data_type, crate::types::DataType::Variant)
     {
         return true;
     }
@@ -1804,11 +1804,11 @@ mod tests {
 
         assert!(is_parquet_field_match_source_schema(
             &variant,
-            &RwType::Jsonb
+            &RwType::Variant
         ));
         assert!(!is_parquet_schema_match_source_schema(
             variant.data_type(),
-            &RwType::Jsonb
+            &RwType::Variant
         ));
         // A variant field also still matches its raw physical struct layout.
         let rw_physical = RwType::Struct(StructType::new(vec![
@@ -1823,7 +1823,7 @@ mod tests {
             ArrowType::Struct(vec![variant_field("v")].into()),
             true,
         );
-        let rw_struct = RwType::Struct(StructType::new(vec![("v".to_owned(), RwType::Jsonb)]));
+        let rw_struct = RwType::Struct(StructType::new(vec![("v".to_owned(), RwType::Variant)]));
         assert!(is_parquet_field_match_source_schema(
             &arrow_struct,
             &rw_struct
@@ -1836,7 +1836,7 @@ mod tests {
         );
         assert!(is_parquet_field_match_source_schema(
             &arrow_list,
-            &RwType::list(RwType::Jsonb)
+            &RwType::list(RwType::Variant)
         ));
 
         let arrow_map = ArrowField::new(
@@ -1859,7 +1859,7 @@ mod tests {
         );
         assert!(is_parquet_field_match_source_schema(
             &arrow_map,
-            &RwType::Map(MapType::from_kv(RwType::Varchar, RwType::Jsonb))
+            &RwType::Map(MapType::from_kv(RwType::Varchar, RwType::Variant))
         ));
     }
 
