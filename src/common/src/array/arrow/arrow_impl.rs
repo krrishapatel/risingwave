@@ -664,7 +664,10 @@ pub trait FromArrow {
         ) = (field.data_type(), array.data_type())
         {
             let dominated = Self::struct_fields_dominated(expected_fields, actual_fields);
-            if dominated {
+            // Extension-name mismatches on children (e.g. a variant child declared as its
+            // raw physical struct) also need the projected path, which picks the
+            // conversion field per child based on the declared type.
+            if dominated || Self::struct_child_extension_mismatch(expected_fields, actual_fields) {
                 let struct_array: &arrow_array::StructArray =
                     array.as_any().downcast_ref().unwrap();
                 return self.from_struct_array_projected(expected_fields, struct_array);
@@ -976,6 +979,22 @@ pub trait FromArrow {
         )))
     }
 
+    /// Returns `true` if any name-aligned child differs in extension name between the
+    /// expected and actual fields.
+    fn struct_child_extension_mismatch(
+        expected_fields: &arrow_schema::Fields,
+        actual_fields: &arrow_schema::Fields,
+    ) -> bool {
+        expected_fields.iter().any(|expected| {
+            actual_fields
+                .iter()
+                .find(|actual| actual.name() == expected.name())
+                .is_some_and(|actual| {
+                    actual.extension_type_name() != expected.extension_type_name()
+                })
+        })
+    }
+
     /// Returns `true` if all expected fields are present in `actual_fields`, and `actual_fields`
     /// has more fields or has them in a different order.
     ///
@@ -1028,24 +1047,44 @@ pub trait FromArrow {
             .collect();
 
         let len = array.len();
-        let projected_columns = expected_fields
-            .iter()
-            .map(|expected_field| {
-                if let Some(&idx) = actual_name_to_index.get(expected_field.name().as_str()) {
-                    let child = array.columns()[idx].clone();
-                    self.from_array(expected_field, &child).map(Arc::new)
+        let mut child_types = Vec::with_capacity(expected_fields.len());
+        let mut projected_columns = Vec::with_capacity(expected_fields.len());
+        for expected_field in expected_fields {
+            if let Some(&idx) = actual_name_to_index.get(expected_field.name().as_str()) {
+                let child = array.columns()[idx].clone();
+                // For an extension-typed child (e.g. variant) declared as a non-struct RW
+                // type, only the actual field carries the metadata that routes the
+                // conversion; a struct declaration keeps reading the raw physical layout
+                // via the expected field. The child type must follow the same choice.
+                let actual_field = &actual_fields[idx];
+                let convert_field = if actual_field.extension_type_name().is_some()
+                    && expected_field.extension_type_name().is_none()
+                    && !matches!(
+                        expected_field.data_type(),
+                        arrow_schema::DataType::Struct(_)
+                    ) {
+                    actual_field
                 } else {
-                    // Field missing in Arrow struct. Fill SQL NULL with the expected RW type.
-                    let rw_ty = self.from_field(expected_field)?;
-                    let mut builder = ArrayBuilderImpl::with_type(len, rw_ty);
-                    builder.append_n(len, Datum::None);
-                    Ok(Arc::new(builder.finish()))
-                }
-            })
-            .try_collect()?;
+                    expected_field
+                };
+                // Derive the child type from the converted array: for container children
+                // (e.g. map<_, jsonb> backed by nested variants) the conversion follows
+                // the array-side fields, which the expected field cannot express.
+                let converted = self.from_array(convert_field, &child)?;
+                child_types.push((expected_field.name().clone(), converted.data_type()));
+                projected_columns.push(Arc::new(converted));
+            } else {
+                // Field missing in Arrow struct. Fill SQL NULL with the expected RW type.
+                let rw_ty = self.from_field(expected_field)?;
+                let mut builder = ArrayBuilderImpl::with_type(len, rw_ty.clone());
+                builder.append_n(len, Datum::None);
+                child_types.push((expected_field.name().clone(), rw_ty));
+                projected_columns.push(Arc::new(builder.finish()));
+            }
+        }
 
         Ok(ArrayImpl::Struct(StructArray::new(
-            self.from_fields(expected_fields)?,
+            StructType::new(child_types),
             projected_columns,
             (0..len).map(|i| array.is_valid(i)).collect(),
         )))
@@ -1629,21 +1668,19 @@ impl From<&arrow_array::Decimal256Array> for Int256Array {
 
 /// Field-aware version of [`is_parquet_schema_match_source_schema`]: additionally matches an
 /// `arrow.parquet.variant` struct against `Jsonb`, which requires the extension name in the
-/// field metadata. Prefer this whenever a `Field` is available.
+/// field metadata. Any other declared type (e.g. the raw physical struct) falls through to
+/// the physical-type match. Prefer this whenever a `Field` is available.
 pub fn is_parquet_field_match_source_schema(
     arrow_field: &arrow_schema::Field,
     rw_data_type: &crate::types::DataType,
 ) -> bool {
     use arrow_schema::extension::ExtensionType as _;
 
-    if arrow_field
-        .metadata()
-        .get("ARROW:extension:name")
-        .map(String::as_str)
-        == Some(parquet_variant_compute::VariantType::NAME)
+    if arrow_field.extension_type_name() == Some(parquet_variant_compute::VariantType::NAME)
         && matches!(arrow_field.data_type(), arrow_schema::DataType::Struct(_))
+        && matches!(rw_data_type, crate::types::DataType::Jsonb)
     {
-        return matches!(rw_data_type, crate::types::DataType::Jsonb);
+        return true;
     }
     is_parquet_schema_match_source_schema(arrow_field.data_type(), rw_data_type)
 }
@@ -1747,7 +1784,6 @@ mod tests {
     use crate::types::{DataType as RwType, MapType, StructType};
 
     fn variant_field(name: &str) -> ArrowField {
-        use std::collections::HashMap;
         ArrowField::new(
             name,
             ArrowType::Struct(
@@ -1759,10 +1795,7 @@ mod tests {
             ),
             true,
         )
-        .with_metadata(HashMap::from([(
-            "ARROW:extension:name".to_owned(),
-            "arrow.parquet.variant".to_owned(),
-        )]))
+        .with_extension_type(parquet_variant_compute::VariantType)
     }
 
     #[test]
@@ -1777,15 +1810,12 @@ mod tests {
             variant.data_type(),
             &RwType::Jsonb
         ));
-        // The extension takes precedence over the physical struct type.
+        // A variant field also still matches its raw physical struct layout.
         let rw_physical = RwType::Struct(StructType::new(vec![
             ("metadata".to_owned(), RwType::Bytea),
             ("value".to_owned(), RwType::Bytea),
         ]));
-        assert!(!is_parquet_field_match_source_schema(
-            &variant,
-            &rw_physical
-        ));
+        assert!(is_parquet_field_match_source_schema(&variant, &rw_physical));
 
         // Variant nested in struct / list / map.
         let arrow_struct = ArrowField::new(
