@@ -1689,15 +1689,16 @@ impl From<&arrow_array::Decimal256Array> for Int256Array {
     }
 }
 
-/// Field-aware version of [`is_parquet_schema_match_source_schema`]: additionally matches an
-/// `arrow.parquet.variant` struct against `Variant`, which requires the extension name in the
-/// field metadata. Any other declared type (e.g. the raw physical struct) falls through to
-/// the physical-type match. Prefer this whenever a `Field` is available.
+/// Field-aware version of [`is_parquet_schema_match_source_schema`]: it inspects the field
+/// metadata to match an `arrow.parquet.variant` struct against `Variant`. A variant extension
+/// binds exclusively to `Variant` at every nesting depth — declaring such a column as anything
+/// else (e.g. the raw physical struct) is an illegal type mismatch, so the parser NULL-fills it
+/// instead of decoding a diverging type. Prefer this whenever a `Field` is available.
 ///
-/// At or below a list-element / map-entry boundary, a file-side extension that the declared
-/// type does not consume causes a mismatch, so the parser NULL-fills the column instead of
-/// decoding a type that diverges from the catalog. Top-level and struct-child positions stay
-/// lenient because they decode by the declared side and ignore unconsumed extensions.
+/// Other (non-variant) file-side extensions are only rejected at or below a list-element /
+/// map-entry boundary, where the decode follows the array's own field and the declared side
+/// cannot steer it; at top-level / struct-child positions they stay lenient and decode by the
+/// declared side.
 pub fn is_parquet_field_match_source_schema(
     arrow_field: &arrow_schema::Field,
     rw_data_type: &crate::types::DataType,
@@ -1714,12 +1715,11 @@ fn is_parquet_field_match_source_schema_inner(
 ) -> bool {
     use arrow_schema::extension::ExtensionType as _;
 
-    // The variant arm is the only place a file-side extension is consumed.
-    if arrow_field.extension_type_name() == Some(parquet_variant_compute::VariantType::NAME)
-        && matches!(arrow_field.data_type(), arrow_schema::DataType::Struct(_))
-        && matches!(rw_data_type, crate::types::DataType::Variant)
-    {
-        return true;
+    // A file-side variant extension binds exclusively to `Variant` at every depth; matching it
+    // against any other declared type is an illegal type mismatch, not a lenient physical match.
+    if arrow_field.extension_type_name() == Some(parquet_variant_compute::VariantType::NAME) {
+        return matches!(arrow_field.data_type(), arrow_schema::DataType::Struct(_))
+            && matches!(rw_data_type, crate::types::DataType::Variant);
     }
     if strict_ext && arrow_field.extension_type_name().is_some() {
         return false;
@@ -1866,12 +1866,16 @@ mod tests {
             variant.data_type(),
             &RwType::Variant
         ));
-        // A variant field also still matches its raw physical struct layout.
+        // A variant field does NOT match its raw physical struct layout: the variant extension
+        // binds exclusively to `Variant`, so declaring it as a struct is an illegal type mismatch.
         let rw_physical = RwType::Struct(StructType::new(vec![
             ("metadata".to_owned(), RwType::Bytea),
             ("value".to_owned(), RwType::Bytea),
         ]));
-        assert!(is_parquet_field_match_source_schema(&variant, &rw_physical));
+        assert!(!is_parquet_field_match_source_schema(
+            &variant,
+            &rw_physical
+        ));
 
         // Variant nested in struct / list / map.
         let arrow_struct = ArrowField::new(
